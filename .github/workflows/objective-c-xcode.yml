@@ -19,9 +19,13 @@ jobs:
         with:
           submodules: recursive
 
-      - name: 选择 Xcode 版本
+      - name: 查找并选择 Xcode 版本
         run: |
-          sudo xcode-select -s /Applications/Xcode_27.app/Contents/Developer
+          echo "可用的 Xcode 版本如下："
+          ls /Applications/ | grep Xcode
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          echo "正在使用：$XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
           xcodebuild -version
 
       - name: 安装 Homebrew 依赖
