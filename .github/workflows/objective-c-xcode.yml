@@ -84,6 +84,16 @@ jobs:
           ls -d ish-arm64/deps/libapps ish-arm64/deps/libarchive ish-arm64/app || true
           ls ish-arm64/app/RootfsPatch.bundle >/dev/null 2>&1 && echo "RootfsPatch.bundle 存在" || echo "RootfsPatch.bundle 缺失"
 
+          # 宿主主机名长度：iSH 的 kernel/uname.c 会把 uname().nodename 无界地
+          # strcpy 进 guest 的 65 字节字段，宿主主机名 ≥65 字符就会在模拟器里
+          # SIGTRAP（见下面第 4c 步）。这里把真实值打出来，方便事后对账。
+          echo "--- 宿主主机名（iSH 会拷进 65 字节的 utsname.hostname） ---"
+          HOSTN="$(hostname)"
+          echo "hostname = [$HOSTN]"
+          echo "length   = $(printf '%s' "$HOSTN" | wc -c | tr -d ' ')  (>=65 就会触发崩溃)"
+          python3 -c 'import os;n=os.uname().nodename;print("uname().nodename = [%s] len=%d"%(n,len(n)))' 2>/dev/null || \
+            echo "（拿不到 python3，跳过 uname() 复核）"
+
       # ------------------------------------------------------------------
       # 3. 腾磁盘
       #    最终产物包含 ~81MB 的 root.tar.gz + iSH 静态库，DERIVED_DATA 也不小。
@@ -160,24 +170,103 @@ jobs:
       #       3. cc.find_library('archive', dirs: /opt/homebrew/opt/libarchive/lib)
       #     把 PKG_CONFIG_PATH 指到 Homebrew 的 libarchive，第 1 条直接命中，最稳。
       #
-      #     只把 PKG_CONFIG_PATH / CPPFLAGS 写进 $GITHUB_ENV（对后面
-      #     xcodebuild 无害）；LDFLAGS 留到第 7 步局部设置，避免干扰 App 链接。
+      #     只把 PKG_CONFIG_PATH / LA_PREFIX 写进 $GITHUB_ENV（对后面
+      #     xcodebuild 无害）；CPPFLAGS / LDFLAGS 留到第 6 步局部设置，
+      #     避免 Homebrew 的 include 路径污染 iOS 目标的编译。
       # ------------------------------------------------------------------
       - name: 配置 libarchive 发现路径
         run: |
           set -uo pipefail
           LA="$(brew --prefix libarchive)"
           echo "libarchive prefix = $LA"
-          ls -l "$LA/lib/libarchive.dylib" 2>/dev/null || ls -l "$LA/lib/libarchive.a" 2>/dev/null || \
-            { echo "::error::libarchive 库文件不存在，fakefsify 不会被编译，rootfs 一定失败"; exit 1; }
-          ls -d "$LA/lib/pkgconfig" 2>/dev/null || echo "（无 pkgconfig 目录）"
+          # 用通配，兼容只有版本化 dylib（libarchive.13.dylib）而没有裸符号链接的情况
+          ls -l "$LA/lib"/libarchive* 2>/dev/null || {
+            echo "::error::libarchive 库文件不存在（$LA/lib 下找不到 libarchive*），fakefsify 不会被编译，rootfs 一定失败";
+            exit 1;
+          }
+          ls -d "$LA/lib/pkgconfig" 2>/dev/null || echo "（无 pkgconfig 目录，meson 会走 find_library 兜底）"
 
           echo "PKG_CONFIG_PATH=$LA/lib/pkgconfig" >> "$GITHUB_ENV"
-          echo "CPPFLAGS=-I$LA/include" >> "$GITHUB_ENV"
           echo "LA_PREFIX=$LA" >> "$GITHUB_ENV"
 
           pkg-config --exists libarchive && echo "pkg-config 找到 libarchive ✓ ($(pkg-config --modversion libarchive))" || \
             echo "!! pkg-config 找不到 libarchive（meson 会退回 find_library，通常也能成功）"
+
+      # ------------------------------------------------------------------
+      # 4c. 修补 ish-arm64/kernel/uname.c —— 修「模拟器一启动就 SIGTRAP」
+      #
+      #     第二次真跑踩到的坑（不是 libarchive 了，那个已经修好）：
+      #
+      #       ==> Guest phase 1: packages
+      #       === HOST CRASH: signal 5 ===
+      #       2   libsystem_c.dylib   __chk_fail_overflow + 24
+      #       3   libsystem_c.dylib   stpcpy + 0
+      #       4   ish                 sys_uname + 196
+      #
+      #     也就是 guest 第一次调 uname()（/bin/sh 启动时就会调）就把**宿主**
+      #     的 ish 进程干掉了，signal 5 = SIGTRAP = 强化检查失败（缓冲区溢出）。
+      #
+      #     根因在 kernel/uname.c 的 do_uname()（上游 ish-app/ish 是同样的代码）：
+      #
+      #       struct utsname real_uname;
+      #       uname(&real_uname);                       // ← 没有零初始化、没查返回值
+      #       const char *hostname = real_uname.nodename;
+      #       ...
+      #       strcpy(uts->hostname, hostname);          // ← 目标只有 65 字节，无界拷贝
+      #
+      #     struct uname 的每个字段都是 UNAME_LENGTH=65（kernel/calls.h 第 269 行），
+      #     而 host 的 nodename 是**运行环境决定**的：
+      #       · 宿主主机名 ≥65 字符 → stpcpy 直接冲爆 65 字节字段；
+      #       · uname() 失败/字段没被填 → real_uname 是栈上垃圾，找不到 NUL
+      #         也会一直拷下去。
+      #     两者都只会在特定宿主上炸（作者本地 Mac 主机名短，所以他没遇到；
+      #     云端 runner 恰好会炸）。Linux 本来的语义就是「截断到 64 字符」，
+      #     所以改成有界拷贝**更**符合 guest 预期，不改变正常情况下的行为。
+      #
+      #     注意：Xcode 工程里的 "Build Meson (iSH-ARM64)" 阶段会再编一次
+      #     这份源码，所以补丁必须在这一步打，两边才一致。
+      # ------------------------------------------------------------------
+      - name: 修补 uname.c（宿主主机名溢出导致模拟器崩溃）
+        run: |
+          set -euo pipefail
+          F=ish-arm64/kernel/uname.c
+          test -f "$F" || { echo "::error::$F 不存在"; exit 1; }
+
+          # 幂等：如果 fork 里已经是安全版本（hostname 走有界拷贝），别重复打
+          if grep -q 'snprintf(uts->hostname' "$F"; then
+            echo "uname.c 已经是安全版本（hostname 用 snprintf），跳过补丁"
+            exit 0
+          fi
+          cp "$F" "$F.orig"
+
+          # 用 awk（macOS 自带，不依赖 python）做三处最小改动：
+          #   1. real_uname 零初始化
+          #   2. uname() 失败就退回 "ish"，不用栈垃圾
+          #   3. 写 guest hostname 改成 snprintf（等效——只保留前 64 个字符）
+          # 匹配用前缀（不含参数），这样上游把参数改名也不会漏补。
+          awk '
+            index($0, "struct utsname real_uname;") > 0 {
+              print $0
+              print "    memset(&real_uname, 0, sizeof(real_uname));"
+              print "    if (uname(&real_uname) != 0)"
+              print "        strcpy(real_uname.nodename, \"ish\");"
+              next
+            }
+            index($0, "uname(&real_uname);") > 0 { next }
+            index($0, "strcpy(uts->hostname,") > 0 {
+              print "    snprintf(uts->hostname, sizeof(uts->hostname), \"%s\", hostname);"
+              next
+            }
+            { print $0 }
+          ' "$F.orig" > "$F"
+
+          echo "--- 补丁后的 do_uname ---"
+          sed -n '17,36p' "$F"
+          grep -q 'memset(&real_uname' "$F" || { echo "::error::补丁 1 没打上（结构体没零初始化）"; exit 1; }
+          grep -q 'if (uname(&real_uname) != 0)' "$F" || { echo "::error::补丁 2 没打上（没检查 uname 返回值）"; exit 1; }
+          grep -q 'snprintf(uts->hostname' "$F" || { echo "::error::补丁 3 没打上（hostname 仍是无界 strcpy）"; exit 1; }
+          diff -u "$F.orig" "$F" || true
+          echo "uname.c 补丁已生效 ✓"
 
       # ------------------------------------------------------------------
       # 5. 定位 ld.lld 并注入 PATH
@@ -270,12 +359,15 @@ jobs:
           set -euo pipefail
           # 双保险：meson/ninja/ld.lld 必须在 PATH 上（Makefile 会自己查 ld.lld）
           export PATH="/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/opt/lld/bin:$PATH"
-          export PKG_CONFIG_PATH="${LA_PREFIX:-/opt/homebrew/opt/libarchive}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          export LDFLAGS="-L${LA_PREFIX:-/opt/homebrew/opt/libarchive}/lib"
+          # 局部设置（不写进 $GITHUB_ENV），只影响这次 meson/ninja
+          export LA="${LA_PREFIX:-/opt/homebrew/opt/libarchive}"
+          export PKG_CONFIG_PATH="$LA/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export CPPFLAGS="-I$LA/include"
+          export LDFLAGS="-L$LA/lib"
           echo "ld.lld  -> $(command -v ld.lld || echo 缺失)"
           echo "meson   -> $(command -v meson || echo 缺失)"
           echo "ninja   -> $(command -v ninja || echo 缺失)"
-          echo "libarchive -> ${LA_PREFIX:-未设置}"
+          echo "libarchive -> $LA"
           command -v ld.lld >/dev/null || { echo "::error::ld.lld 缺失，make emulator 会直接失败"; exit 1; }
           pkg-config --exists libarchive && echo "pkg-config: libarchive ✓" || echo "!! pkg-config 找不到 libarchive"
 
@@ -287,15 +379,64 @@ jobs:
           make emulator
 
           echo "--- 产物核对 ---"
-          ls -la ish-arm64/build-arm64-release/ish || { echo "::error::ish CLI 没编出来"; exit 1; }
-          ls -la ish-arm64/build-arm64-release/tools/fakefsify || {
-            echo "::error::tools/fakefsify 没编出来。"
-            echo "::error::原因几乎一定是 meson 没找到 libarchive —— 看上面的 meson setup 输出里"
-            echo "::error::有没有 'libarchive' 相关的 Dependency 行，以及 pkg-config 那行是否 ✓。"
+          # 用 -x 判断（和 build-rootfs.sh 自己的检查一致）：ls 成功不代表可执行
+          test -x ish-arm64/build-arm64-release/ish || {
+            echo "::error::ish CLI 没编出来（列一下 build 目录看看）"
+            ls -la ish-arm64/build-arm64-release 2>/dev/null || true
             exit 1
           }
-          ls -la ish-arm64/build-arm64-release/tools/unfakefsify 2>/dev/null || \
-            echo "（unfakefsify 软链未列出，稍后由 build-rootfs.sh 自行处理）"
+          test -x ish-arm64/build-arm64-release/tools/fakefsify || {
+            echo "::error::tools/fakefsify 没编出来。"
+            echo "::error::原因几乎一定是 meson 没找到 libarchive —— 往上看 meson setup 输出里"
+            echo "::error::有没有 libarchive 的 Dependency 行，以及 'pkg-config: libarchive ✓' 那行。"
+            echo "::error::（ish-arm64/tools/meson.build 只在 libarchive.found() 时才注册这个目标，找不到就静默跳过）"
+            ls -la ish-arm64/build-arm64-release/tools 2>/dev/null || true
+            exit 1
+          }
+          # unfakefsify 是 meson 的 custom_target（ln -sf fakefsify unfakefsify），
+          # build-rootfs.sh 导出 root.tar.gz 时要用它，缺了同样会挂。
+          test -x ish-arm64/build-arm64-release/tools/unfakefsify || {
+            echo "::error::tools/unfakefsify 软链缺失，build-rootfs.sh 导出 root.tar.gz 会失败"
+            exit 1
+          }
+          ls -la ish-arm64/build-arm64-release/ish ish-arm64/build-arm64-release/tools/
+
+      # ------------------------------------------------------------------
+      # 6b. 冒烟测试：让 guest 真的启动一次
+      #
+      #     `make emulator` 成功 ≠ 模拟器能跑。上次就是编译全绿，直到第 9 步
+      #     rootfs 构建的 "Guest phase 1" 才崩（host SIGTRAP），前面 4 分钟的
+      #     npm ci / apk 全白烧。
+      #
+      #     这里用最小的 Alpine minirootfs 复现 build-rootfs.sh 里那条完全相同的
+      #     命令：fakefsify → `ish -f fakefs /bin/sh`。约 30 秒就能判定模拟器
+      #     到底能不能用，崩了当场停在这里。
+      # ------------------------------------------------------------------
+      - name: 冒烟测试 iSH 模拟器（guest 启动）
+        run: |
+          set -euo pipefail
+          BASE="$GITHUB_WORKSPACE/ish-arm64/build-arm64-release"
+          # 故意用 scripts/build-rootfs.sh 的同一个缓存目录（WORK 默认
+          # $ROOT/build/rootfs-work），这样 Alpine 只需下载一次，
+          # 第 8 步 build-rootfs.sh 会直接复用这个 tarball。
+          WORK="$GITHUB_WORKSPACE/build/rootfs-work"
+          TARBALL="$WORK/alpine-minirootfs-3.21.0-aarch64.tar.gz"
+          URL="https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz"
+          mkdir -p "$WORK"
+          if [ ! -f "$TARBALL" ]; then
+            curl -fsSL --retry 3 --retry-delay 2 -o "$TARBALL.part" "$URL"
+            mv "$TARBALL.part" "$TARBALL"      # 只让完整文件落位，避免半截文件被复用
+          fi
+          ls -lh "$TARBALL"
+
+          cd "$WORK"
+          echo "--- fakefsify ---"
+          "$BASE/tools/fakefsify" "$TARBALL" fakefs
+
+          echo "--- guest 启动测试（就是 build-rootfs.sh 的第一条 guest 命令）---"
+          "$BASE/ish" -f "$WORK/fakefs" /bin/sh -c 'uname -a; echo SMOKE_OK'
+
+          echo "模拟器冒烟通过 ✓"
 
       # ------------------------------------------------------------------
       # 7. 生成 DSH.xcodeproj
@@ -481,6 +622,13 @@ jobs:
 
             App 内已打包 Alpine + Node 22 + dsh 的 guest 镜像（`root.tar.gz`），
             装好后无需任何服务器或电脑。
+
+            构建时对上游源码打了一处**最小修补**（工作流第 6 步，可自行核对）：
+            `ish-arm64/kernel/uname.c` 里把宿主 `uname().nodename` 无界拷进
+            65 字节字段的 `strcpy` 改成有界 `snprintf`（Linux 语义本来就是截断到
+            64 字符），并给 host 的 `utsname` 做零初始化 —— 否则在部分云端/
+            长主机名的机器上，guest 第一次调用 `uname()` 就会让模拟器 SIGTRAP。
+            除此之外没有任何代码改动。
 
             安装前必须自行签名（SideStore / AltStore 等）。
             免费 Apple ID 签名有效期 7 天，到期需重新签名。要求 iOS / iPadOS 16+。
