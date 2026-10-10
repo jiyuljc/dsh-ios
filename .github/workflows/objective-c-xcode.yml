@@ -1,69 +1,440 @@
-name: Build Unsigned IPA
+# ============================================================================
+# DSH (DeepSeek Harness on iPad/iPhone) —— 在 GitHub 云端 Mac 上构建「未签名 IPA」
+#
+# 适用仓库：everettjf/dsh-ios 的 fork
+# 工程/方案：DSH.xcodeproj / DSH
+#
+# 与 Harness Mobile 那套的关键差异（别把两边的工作流搞混）：
+#   · 这里的 ish-arm64/deps/libapps 与 deps/libarchive 是**已 vendored 的
+#     普通目录**，不是 git submodule —— 所以**不需要**拉子模块。
+#   · rootfs 不是下载来的，而是在 macOS 上用**自己编出来的 iSH CLI 模拟器**
+#     现场构建（Alpine + Node 22 + dsh），产物 build/root.tar.gz 约 81 MB。
+#     不需要 Docker、不需要 QEMU。
+#   · 工程真源是脚本生成的：scripts/gen-xcode-project.rb（make project）。
+#   · 部署目标是 iOS 16.0，官方 README 要求 Xcode 27 + brew install meson ninja lld。
+#   · 没有哈希审计拦截（上一套项目那个 artifacts.lock.json 问题这里不存在）。
+#
+# 官方 README 明确说「本项目没有托管 CI」，所以这份工作流是从
+# Makefile / scripts/build-rootfs.sh / DSH.xcodeproj 反推出来的等价流程。
+#
+# 用法：仓库 → Actions → Build Unsigned IPA (DSH) → Run workflow
+# ============================================================================
+
+name: Build Unsigned IPA (DSH)
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（如 0.1.0）'
+        description: '版本号（只用于给产物命名，会覆盖同名 Release）'
         required: true
-        default: '0.1.0'
+        default: '1.0.16'
+      build_rootfs:
+        description: '构建 rootfs（Alpine + Node 22 + dsh，约 81MB、需联网）。首次必须为 true'
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: write    # 发布 Release 需要
+
+concurrency:
+  group: build-dshipa-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: macos-15
-    timeout-minutes: 240
+    # README 要求 Xcode 27；xcode-27 是目前唯一带 iOS 27 SDK 的托管镜像。
+    runs-on: xcode-27
+    timeout-minutes: 360
+
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      # 让 npm 在国内/受限网络下也稳一些
+      npm_config_fund: 'false'
+      npm_config_audit: 'false'
 
     steps:
-      - name: 检出仓库（含子模块）
+      # ------------------------------------------------------------------
+      # 1. 检出仓库
+      #
+      #    注意：不需要 submodules —— ish-arm64 的依赖已 vendored。
+      # ------------------------------------------------------------------
+      - name: 检出仓库
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          fetch-depth: 1
 
-      - name: 查找并选择 Xcode 版本
+      # ------------------------------------------------------------------
+      # 2. 确认云端环境
+      # ------------------------------------------------------------------
+      - name: 检查云端环境
         run: |
-          echo "可用的 Xcode 版本如下："
-          ls /Applications/ | grep Xcode
-          XCODE_PATH=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
-          echo "正在使用：$XCODE_PATH"
-          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
+          set -uo pipefail
+          sw_vers
+          uname -m
+          echo "--- 可用的 Xcode ---"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          echo "--- 当前 Xcode ---"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          echo "--- 磁盘 ---"
+          df -h /
+          echo "--- 关键目录是否就位（vendored，不需要联网拉） ---"
+          ls -d ish-arm64/deps/libapps ish-arm64/deps/libarchive ish-arm64/app || true
+          ls ish-arm64/app/RootfsPatch.bundle >/dev/null 2>&1 && echo "RootfsPatch.bundle 存在" || echo "RootfsPatch.bundle 缺失"
+
+      # ------------------------------------------------------------------
+      # 3. 腾磁盘
+      #    最终产物包含 ~81MB 的 root.tar.gz + iSH 静态库，DERIVED_DATA 也不小。
+      # ------------------------------------------------------------------
+      - name: 腾出磁盘空间
+        continue-on-error: true
+        run: |
+          df -h /
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/iOS*.simruntime || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches/* || true
+          df -h /
+
+      # ------------------------------------------------------------------
+      # 4. 安装依赖
+      #
+      #    官方 README 第 83 行原话：
+      #      brew install meson ninja lld
+      #      (ld.lld builds the guest VDSO; without it the guest cannot run)
+      #    还需要：Node.js ≥ 20 + npm（rootfs 在宿主上 npm ci）、
+      #    xcodeproj gem（生成工程）、python3（hterm 编译脚本）。
+      #
+      #    ⚠️ 上一套项目踩过的坑在这里同样适用并已规避：
+      #       Homebrew 的 LLVM 从 23.x 起**不再包含 ld.lld**，
+      #       必须单独装 `lld` 公式。
+      # ------------------------------------------------------------------
+      - name: 安装构建依赖
+        run: |
+          set -uo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_INSTALL_CLEANUP=1
+
+          # 逐个装，互不牵连
+          for pkg in meson ninja lld llvm node python3; do
+            echo "---------- brew install $pkg ----------"
+            if brew list --formula "$pkg" >/dev/null 2>&1; then
+              echo "已安装，跳过: $pkg"
+              continue
+            fi
+            brew install "$pkg" 2>&1 | tail -n 15
+            brew list --formula "$pkg" >/dev/null 2>&1 && echo "OK: $pkg" || echo "!! $pkg 安装失败"
+          done
+
+          echo "---------- 安装 xcodeproj gem ----------"
+          # macOS runner 自带的 ruby 装 gem 需要 sudo
+          sudo gem install xcodeproj --no-document 2>&1 | tail -n 10 || \
+            gem install --user-install xcodeproj --no-document 2>&1 | tail -n 10 || \
+            echo "!! xcodeproj 安装失败"
+
+          echo "---------- 结果核对 ----------"
+          for pkg in meson ninja lld llvm node python3; do
+            if brew list --formula "$pkg" >/dev/null 2>&1; then
+              echo "  $pkg -> $(brew --prefix "$pkg")"
+            else
+              echo "  $pkg -> 未安装"
+            fi
+          done
+
+      # ------------------------------------------------------------------
+      # 5. 定位 ld.lld 并注入 PATH
+      #
+      #    这段逻辑是从上一套项目血泪换来的，直接复用：
+      #    Homebrew 的 llvm 是 keg-only，且 23.x 起不含 ld.lld；
+      #    真正的来源是独立的 `lld` 公式。
+      #
+      #    同时把 meson / ninja / node 的 bin 也保证在 PATH 上。
+      # ------------------------------------------------------------------
+      - name: 定位 ld.lld 并注入 PATH
+        run: |
+          set -uo pipefail
+
+          echo "========== 定位 ld.lld =========="
+          for pkg in lld llvm; do
+            P="$(brew --prefix "$pkg" 2>/dev/null || true)"
+            echo "brew --prefix $pkg -> '${P:-<空>}'"
+            [ -n "$P" ] && [ -d "$P/bin" ] && ls "$P/bin" 2>/dev/null | grep -E 'ld\.lld|lld' || true
+          done
+
+          LLD_BIN=""
+          for d in \
+            "$(brew --prefix lld 2>/dev/null)/bin" \
+            /opt/homebrew/opt/lld/bin \
+            /opt/homebrew/bin \
+            /usr/local/opt/lld/bin \
+            /usr/local/bin ; do
+            if [ -n "$d" ] && [ -x "$d/ld.lld" ]; then LLD_BIN="$d"; break; fi
+          done
+
+          if [ -z "$LLD_BIN" ]; then
+            DEEP="$(find /opt/homebrew/Cellar /opt/homebrew/opt -name 'ld.lld' -type f 2>/dev/null | head -n 1 || true)"
+            [ -n "$DEEP" ] && LLD_BIN="$(dirname "$DEEP")"
+          fi
+
+          if [ -z "$LLD_BIN" ]; then
+            echo "--- 重试 brew install lld ---"
+            brew install --verbose lld 2>&1 | tail -n 30 || true
+            P="$(brew --prefix lld 2>/dev/null || true)"
+            [ -n "$P" ] && [ -x "$P/bin/ld.lld" ] && LLD_BIN="$P/bin"
+          fi
+
+          if [ -z "$LLD_BIN" ]; then
+            echo "::error::找不到 ld.lld。Makefile 的 emulator 目标会直接判失败（guest VDSO 需要它）。"
+            exit 1
+          fi
+          echo "选定 LLD_BIN = $LLD_BIN"
+          echo "$LLD_BIN" >> "$GITHUB_PATH"
+
+          # 其他工具的 bin 也补上（keg-only 的 llvm 用于 llvm-ar 等）
+          for pkg in llvm node ninja meson; do
+            P="$(brew --prefix "$pkg" 2>/dev/null || true)"
+            [ -n "$P" ] && [ -d "$P/bin" ] && echo "$P/bin" >> "$GITHUB_PATH"
+          done
+
+          echo "========== 确认 =========="
+          export PATH="$LLD_BIN:/opt/homebrew/bin:$PATH"
+          for t in ld.lld meson ninja node npm python3 ruby gem; do
+            printf '  %-10s %s\n' "$t" "$(command -v "$t" 2>/dev/null || echo '缺失')"
+          done
+          ruby -e 'require "xcodeproj"; puts "xcodeproj gem OK (#{Xcodeproj::VERSION})"' 2>&1 | tail -n 2 || \
+            echo "!! xcodeproj gem 不可用（make project 会失败）"
           xcodebuild -version
 
-      - name: 安装 Homebrew 依赖
-        run: |
-          brew install meson ninja lld
-          brew install node
-          gem install xcodeproj
+          command -v ld.lld >/dev/null || { echo "::error::ld.lld 不可用"; exit 1; }
+          command -v ninja  >/dev/null || { echo "::error::ninja 不可用"; exit 1; }
+          command -v meson  >/dev/null || { echo "::error::meson 不可用"; exit 1; }
+          command -v npm    >/dev/null || { echo "::error::npm 不可用"; exit 1; }
+          echo "工具链就绪 ✓"
 
-      - name: 构建 iSH-ARM64 模拟器
+      # ------------------------------------------------------------------
+      # 6. 构建 iSH-ARM64 CLI 模拟器
+      #
+      #    等价于 `make emulator`，它会：
+      #      · 先检查 ld.lld（缺了直接报 "the guest VDSO needs LLVM's linker"）
+      #      · meson setup build-arm64-release -Dguest_arch=arm64 --buildtype=release
+      #      · ninja -C build-arm64-release
+      #    产出 ish CLI 与 tools/fakefsify —— 这两个是构建 rootfs 的前提。
+      # ------------------------------------------------------------------
+      - name: 构建 iSH-ARM64 模拟器（CLI + fakefsify）
         run: |
+          set -euo pipefail
+          # 双保险：meson/ninja/ld.lld 必须在 PATH 上（Makefile 会自己查 ld.lld）
+          export PATH="/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/opt/lld/bin:$PATH"
+          echo "ld.lld -> $(command -v ld.lld || echo 缺失)"
+          echo "meson  -> $(command -v meson || echo 缺失)"
+          echo "ninja  -> $(command -v ninja || echo 缺失)"
+          command -v ld.lld >/dev/null || { echo "::error::ld.lld 缺失，make emulator 会直接失败"; exit 1; }
           make emulator
+          echo "--- 产物核对 ---"
+          ls -la ish-arm64/build-arm64-release/ish
+          ls -la ish-arm64/build-arm64-release/tools/fakefsify
 
-      - name: 构建 iOS App（无签名）
+      # ------------------------------------------------------------------
+      # 7. 生成 DSH.xcodeproj
+      #
+      #    仓库里的 DSH.xcodeproj 是提交过的，但重新生成能保证与
+      #    ish-arm64/iSH.xcodeproj 同步（gen-xcode-project.rb 会读它）。
+      # ------------------------------------------------------------------
+      - name: 生成 Xcode 工程
         run: |
+          set -euo pipefail
+          make project
+          echo "--- 确认 scheme ---"
+          ls DSH.xcodeproj/xcshareddata/xcschemes/
+          xcodebuild -list -project DSH.xcodeproj
+
+      # ------------------------------------------------------------------
+      # 8. 构建 rootfs
+      #
+      #    等价于 `make rootfs` → scripts/build-rootfs.sh，全部在 macOS 上跑，
+      #    guest 侧通过第 6 步编出来的 iSH CLI 模拟器执行（无 Docker/QEMU）：
+      #      1. 下载 Alpine 3.21 minirootfs (aarch64)
+      #      2. fakefsify 成 fakefs
+      #      3. 宿主上 npm ci --os=linux --cpu=arm64 --libc=musl 拉 @deepseek-ai/dsh
+      #      4. guest 内 apk add nodejs npm …、装 node_modules、打 overlay
+      #      5. guest 内 npx node-gyp rebuild 重建 node-pty（musl）
+      #      6. unfakefsify 导出 build/root.tar.gz（约 81 MB）
+      #
+      #    这一步要联外网（alpinelinux.org + registry.npmjs.org），
+      #    正常耗时 6~20 分钟。
+      # ------------------------------------------------------------------
+      - name: 构建 rootfs（Alpine + Node 22 + dsh）
+        if: ${{ inputs.build_rootfs }}
+        run: |
+          set -euo pipefail
+          # node/npm 可能来自 Homebrew（/opt/homebrew/bin）或 runner 预装
+          # （/usr/local/bin）。两个都放进 PATH 并显式确认。
+          export PATH="/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/opt/lld/bin:$PATH"
+          echo "node -> $(command -v node || echo 缺失)"
+          echo "npm  -> $(command -v npm  || echo 缺失)"
+          node -v
+          npm -v
+          command -v npm >/dev/null || { echo "::error::宿主上没有 npm，build-rootfs.sh 会直接 die"; exit 1; }
+          ./scripts/build-rootfs.sh
+          echo "--- rootfs 产物 ---"
+          ls -lh build/root.tar.gz build/root.tar.gz.sha256
+          cat build/root.tar.gz.sha256
+          df -h /
+
+      # ------------------------------------------------------------------
+      # 9. 兜底检查 root.tar.gz
+      #
+      #    如果勾了 build_rootfs=false，但仓库/缓存里也没有 root.tar.gz，
+      #    xcodebuild 会在 "Copy DSH Root" 阶段报错。这里提前把话说清楚。
+      # ------------------------------------------------------------------
+      - name: 检查 build/root.tar.gz 是否就位
+        run: |
+          set -uo pipefail
+          if [ -f build/root.tar.gz ]; then
+            ls -lh build/root.tar.gz
+            echo "rootfs 就位 ✓"
+          else
+            echo "::error::build/root.tar.gz 不存在。"
+            echo "::error::请把 build_rootfs 输入设为 true 重新运行（它是 App 的必需资源）。"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # 10. 归档 App（无签名）
+      #
+      #    关键设置：
+      #      · ARCHS=arm64 —— xcconfig 里模拟器也只编 arm64，
+      #        注释原话「needs_exe_wrapper / only Apple Silicon simulators」；
+      #      · CODE_SIGNING_ALLOWED=NO + CODE_SIGN_STYLE=Manual
+      #        —— 云端没有你的证书；
+      #      · DSH_DEVELOPMENT_TEAM= —— Makefile 默认写死作者 team
+      #        YPV49M8592，必须清空；
+      #      · 工程里有个 "Build Meson (iSH-ARM64)" 构建阶段会自己编
+      #        libish.a / libish_emu.a / libfakefs.a，
+      #        所以归档这一步耗时较长（十几到几十分钟）。
+      # ------------------------------------------------------------------
+      - name: 归档 App（无签名）
+        run: |
+          set -euo pipefail
           xcodebuild archive \
             -project DSH.xcodeproj \
             -scheme DSH \
             -configuration Release \
             -destination 'generic/platform=iOS' \
-            -archivePath ./build/DSH.xcarchive \
+            -archivePath "$RUNNER_TEMP/DSH.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            DSH_DEVELOPMENT_TEAM="" \
+            IPHONEOS_DEPLOYMENT_TARGET=16.0 \
             CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_ENTITLEMENTS="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            ARCHS=arm64 \
-            ONLY_ACTIVE_ARCH=NO
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation
 
+      # ------------------------------------------------------------------
+      # 11. 打包未签名 IPA
+      # ------------------------------------------------------------------
       - name: 打包未签名 IPA
         run: |
-          cd build/DSH.xcarchive/Products/Applications
-          mkdir -p Payload
-          cp -r *.app Payload/
-          zip -r ../../../DSH-unsigned.ipa Payload
-          cd ../../..
-          mv DSH-unsigned.ipa ./
+          set -euo pipefail
+          APP_DIR="$RUNNER_TEMP/DSH.xcarchive/Products/Applications"
+          test -d "$APP_DIR" || { echo "::error::归档里没有 Applications 目录"; exit 1; }
+          APP_PATH="$(find "$APP_DIR" -maxdepth 1 -name '*.app' | head -n 1)"
+          test -n "$APP_PATH" || { echo "::error::归档里没有 .app"; exit 1; }
+          echo "App: $APP_PATH"
 
-      - name: 上传 IPA 为 Artifact
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/"
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry "DSH-unsigned-${{ inputs.version }}.ipa" Payload
+          mv "DSH-unsigned-${{ inputs.version }}.ipa" "$GITHUB_WORKSPACE/"
+
+      # ------------------------------------------------------------------
+      # 12. 校验 IPA
+      # ------------------------------------------------------------------
+      - name: 校验 IPA
+        run: |
+          set -euo pipefail
+          IPA="DSH-unsigned-${{ inputs.version }}.ipa"
+          unzip -l "$IPA" | head -n 15
+          unzip -l "$IPA" | grep -q 'Payload/.*\.app/' || { echo "::error::IPA 结构不对"; exit 1; }
+
+          mkdir -p "$RUNNER_TEMP/verify" && unzip -q "$IPA" -d "$RUNNER_TEMP/verify"
+          APP="$(find "$RUNNER_TEMP/verify/Payload" -maxdepth 1 -name '*.app' | head -n 1)"
+          BIN="$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+
+          echo "--- 主二进制架构 ---"
+          lipo -info "$BIN"
+          lipo -info "$BIN" | grep -q arm64 || { echo "::error::主二进制不是 arm64"; exit 1; }
+
+          echo "--- 关键内嵌资源 ---"
+          ls -lh "$APP/root.tar.gz" 2>/dev/null || echo "（未找到 root.tar.gz）"
+          test -f "$APP/root.tar.gz" || { echo "::error::IPA 里没有 root.tar.gz，装上去也跑不起来"; exit 1; }
+          ls -lh "$APP/root.tar.gz.sha256" 2>/dev/null || true
+
+          echo "--- 大小 ---"
+          du -sh "$IPA"
+
+      # ------------------------------------------------------------------
+      # 13. 上传 IPA 为 Artifact（临时排查用）
+      # ------------------------------------------------------------------
+      - name: 上传 IPA
         uses: actions/upload-artifact@v4
         with:
-          name: DSH-unsigned-${{ github.event.inputs.version }}
-          path: DSH-unsigned.ipa
+          name: DSH-unsigned-${{ inputs.version }}
+          path: DSH-unsigned-${{ inputs.version }}.ipa
           retention-days: 14
+          if-no-files-found: error
+
+      # ------------------------------------------------------------------
+      # 14. 发布 Release —— 给你「直接下载」用
+      #
+      #    免登录（公开仓库）、不过期、可分享链接：
+      #      https://github.com/<你的用户名>/dsh-ios/releases/latest
+      # ------------------------------------------------------------------
+      - name: 发布 Release（IPA 直接可下载）
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ipa-${{ inputs.version }}
+          name: DSH 未签名 IPA ${{ inputs.version }}
+          body: |
+            `everettjf/dsh-ios`（DSH — DeepSeek Harness on iPad & iPhone）的未签名 IPA。
+
+            构建信息：
+            - 版本号：`${{ inputs.version }}`
+            - runner：`xcode-27`（Xcode 27.0 / iOS 27 SDK）
+            - 架构：`arm64`
+            - 含 rootfs：`${{ inputs.build_rootfs }}`
+            - 触发提交：${{ github.sha }}
+            - 构建时间：${{ github.run_started_at }}
+
+            App 内已打包 Alpine + Node 22 + dsh 的 guest 镜像（`root.tar.gz`），
+            装好后无需任何服务器或电脑。
+
+            安装前必须自行签名（SideStore / AltStore 等）。
+            免费 Apple ID 签名有效期 7 天，到期需重新签名。要求 iOS / iPadOS 16+。
+
+            **未签名产物；项目为 GPL-3.0，转发给他人时请一并履行源码提供义务。**
+          files: DSH-unsigned-${{ inputs.version }}.ipa
+          draft: false
+          prerelease: true
+          fail_on_unmatched_files: true
+
+      # ------------------------------------------------------------------
+      # 15. 还原被脚本改动的文件（build-rootfs.sh 会改写 package-lock.json）
+      # ------------------------------------------------------------------
+      - name: 还原工作区
+        if: always()
+        run: |
+          git checkout -- rootfs/staging/package-lock.json 2>/dev/null || true
+          git status --porcelain || true
+          echo "--- 磁盘收尾 ---"
+          df -h / || true
