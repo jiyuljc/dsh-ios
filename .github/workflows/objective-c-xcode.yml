@@ -105,7 +105,15 @@ jobs:
       #    还需要：Node.js ≥ 20 + npm（rootfs 在宿主上 npm ci）、
       #    xcodeproj gem（生成工程）、python3（hterm 编译脚本）。
       #
-      #    ⚠️ 上一套项目踩过的坑在这里同样适用并已规避：
+      #    ⚠️ libarchive 是**必须的**，虽然 README 没单独提：
+      #       ish-arm64/tools/meson.build 里 fakefsify 只在
+      #       `if libarchive.found()` 成立时才注册为编译目标。
+      #       找不到 libarchive 时 meson 会**静默跳过**，
+      #       于是 tools/fakefsify 压根不会被编出来 ——
+      #       而 scripts/build-rootfs.sh 第 39 行硬要求它存在。
+      #       （这是真实踩过的坑，别再从安装列表里删掉它）
+      #
+      #    ⚠️ 另一个坑同样适用并已规避：
       #       Homebrew 的 LLVM 从 23.x 起**不再包含 ld.lld**，
       #       必须单独装 `lld` 公式。
       # ------------------------------------------------------------------
@@ -116,7 +124,9 @@ jobs:
           export HOMEBREW_NO_INSTALL_CLEANUP=1
 
           # 逐个装，互不牵连
-          for pkg in meson ninja lld llvm node python3; do
+          #   libarchive → fakefsify / unfakefsify 的依赖（见上面注释）
+          #   lld        → ld.lld，guest VDSO 需要
+          for pkg in meson ninja lld llvm libarchive pkg-config node python3; do
             echo "---------- brew install $pkg ----------"
             if brew list --formula "$pkg" >/dev/null 2>&1; then
               echo "已安装，跳过: $pkg"
@@ -133,13 +143,41 @@ jobs:
             echo "!! xcodeproj 安装失败"
 
           echo "---------- 结果核对 ----------"
-          for pkg in meson ninja lld llvm node python3; do
+          for pkg in meson ninja lld llvm libarchive pkg-config node python3; do
             if brew list --formula "$pkg" >/dev/null 2>&1; then
               echo "  $pkg -> $(brew --prefix "$pkg")"
             else
               echo "  $pkg -> 未安装"
             fi
           done
+
+      # ------------------------------------------------------------------
+      # 4b. 让 meson 能发现 libarchive（决定 fakefsify 是否被编译）
+      #
+      #     ish-arm64/tools/meson.build 的查找顺序：
+      #       1. dependency('libarchive')                       ← pkg-config 优先
+      #       2. cc.find_library('archive', dirs: /usr/local/opt/libarchive/lib)
+      #       3. cc.find_library('archive', dirs: /opt/homebrew/opt/libarchive/lib)
+      #     把 PKG_CONFIG_PATH 指到 Homebrew 的 libarchive，第 1 条直接命中，最稳。
+      #
+      #     只把 PKG_CONFIG_PATH / CPPFLAGS 写进 $GITHUB_ENV（对后面
+      #     xcodebuild 无害）；LDFLAGS 留到第 7 步局部设置，避免干扰 App 链接。
+      # ------------------------------------------------------------------
+      - name: 配置 libarchive 发现路径
+        run: |
+          set -uo pipefail
+          LA="$(brew --prefix libarchive)"
+          echo "libarchive prefix = $LA"
+          ls -l "$LA/lib/libarchive.dylib" 2>/dev/null || ls -l "$LA/lib/libarchive.a" 2>/dev/null || \
+            { echo "::error::libarchive 库文件不存在，fakefsify 不会被编译，rootfs 一定失败"; exit 1; }
+          ls -d "$LA/lib/pkgconfig" 2>/dev/null || echo "（无 pkgconfig 目录）"
+
+          echo "PKG_CONFIG_PATH=$LA/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "CPPFLAGS=-I$LA/include" >> "$GITHUB_ENV"
+          echo "LA_PREFIX=$LA" >> "$GITHUB_ENV"
+
+          pkg-config --exists libarchive && echo "pkg-config 找到 libarchive ✓ ($(pkg-config --modversion libarchive))" || \
+            echo "!! pkg-config 找不到 libarchive（meson 会退回 find_library，通常也能成功）"
 
       # ------------------------------------------------------------------
       # 5. 定位 ld.lld 并注入 PATH
@@ -218,21 +256,46 @@ jobs:
       #      · 先检查 ld.lld（缺了直接报 "the guest VDSO needs LLVM's linker"）
       #      · meson setup build-arm64-release -Dguest_arch=arm64 --buildtype=release
       #      · ninja -C build-arm64-release
-      #    产出 ish CLI 与 tools/fakefsify —— 这两个是构建 rootfs 的前提。
+      #
+      #    产出两个后续必需的二进制：
+      #      ish-arm64/build-arm64-release/ish                  ← guest 执行器
+      #      ish-arm64/build-arm64-release/tools/fakefsify      ← 造 fakefs
+      #    （tools/unfakefsify 是指向 fakefsify 的软链，由 meson 一并生成）
+      #
+      #    fakefsify 只有在 libarchive 被 meson 找到时才编译，
+      #    所以这一步开始前必须先确认 libarchive 可用。
       # ------------------------------------------------------------------
       - name: 构建 iSH-ARM64 模拟器（CLI + fakefsify）
         run: |
           set -euo pipefail
           # 双保险：meson/ninja/ld.lld 必须在 PATH 上（Makefile 会自己查 ld.lld）
           export PATH="/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/opt/lld/bin:$PATH"
-          echo "ld.lld -> $(command -v ld.lld || echo 缺失)"
-          echo "meson  -> $(command -v meson || echo 缺失)"
-          echo "ninja  -> $(command -v ninja || echo 缺失)"
+          export PKG_CONFIG_PATH="${LA_PREFIX:-/opt/homebrew/opt/libarchive}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export LDFLAGS="-L${LA_PREFIX:-/opt/homebrew/opt/libarchive}/lib"
+          echo "ld.lld  -> $(command -v ld.lld || echo 缺失)"
+          echo "meson   -> $(command -v meson || echo 缺失)"
+          echo "ninja   -> $(command -v ninja || echo 缺失)"
+          echo "libarchive -> ${LA_PREFIX:-未设置}"
           command -v ld.lld >/dev/null || { echo "::error::ld.lld 缺失，make emulator 会直接失败"; exit 1; }
+          pkg-config --exists libarchive && echo "pkg-config: libarchive ✓" || echo "!! pkg-config 找不到 libarchive"
+
+          # Makefile 的逻辑是「build-arm64-release 存在就跳过 meson setup」。
+          # 如果这个目录是上一次（没装 libarchive 时）留下的，配置会被缓存，
+          # 重跑也不会重新探测依赖 —— 所以这里先删掉，强制干净配置。
+          rm -rf ish-arm64/build-arm64-release
+
           make emulator
+
           echo "--- 产物核对 ---"
-          ls -la ish-arm64/build-arm64-release/ish
-          ls -la ish-arm64/build-arm64-release/tools/fakefsify
+          ls -la ish-arm64/build-arm64-release/ish || { echo "::error::ish CLI 没编出来"; exit 1; }
+          ls -la ish-arm64/build-arm64-release/tools/fakefsify || {
+            echo "::error::tools/fakefsify 没编出来。"
+            echo "::error::原因几乎一定是 meson 没找到 libarchive —— 看上面的 meson setup 输出里"
+            echo "::error::有没有 'libarchive' 相关的 Dependency 行，以及 pkg-config 那行是否 ✓。"
+            exit 1
+          }
+          ls -la ish-arm64/build-arm64-release/tools/unfakefsify 2>/dev/null || \
+            echo "（unfakefsify 软链未列出，稍后由 build-rootfs.sh 自行处理）"
 
       # ------------------------------------------------------------------
       # 7. 生成 DSH.xcodeproj
